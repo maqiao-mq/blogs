@@ -3,8 +3,6 @@ title: 用rust写linux模块？(一)
 date: 2020-03-06 19:30:00
 tags:
 ---
-#  用rust写linux模块？(一)
-
 ​	最近研究了下rust，感觉要是能够用来写linux module，开发体验应该会好很多。这篇文章记录我尝试用rust开发linux模块踩坑的全过程（可能会弃坑）。如果同样有人想要用rust开发linux模块，我的文章应该没有什么帮助，建议直接使用github上已有的一些开源项目，点[这里](https://github.com/fishinabarrel/linux-kernel-module-rust)和[这里](https://github.com/tsgates/rust.ko)。
 
 <!-- more -->

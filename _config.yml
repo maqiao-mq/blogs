@@ -79,5 +79,5 @@ theme: ezread
 ## Docs: https://hexo.io/docs/deployment.html
 deploy:
   type: git
-  repo: git@github.com:QaoAma/QaoAma.github.io.git
+  repo: git@github.com:12-th/12-th.github.io.git
   branch: master

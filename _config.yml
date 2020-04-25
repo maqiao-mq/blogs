@@ -3,7 +3,7 @@
 ## Source: https://github.com/hexojs/hexo/
 
 # Site
-title: mq's website
+title: mq的小站
 subtitle:
 description:
 keywords:
@@ -81,3 +81,11 @@ deploy:
   type: git
   repo: git@github.com:12-th/12-th.github.io.git
   branch: master
+
+ezread:
+  description:
+  - 逝者如斯夫，不舍昼夜
+  - 上善若水，水利万物而不争
+  - hello，world
+  - 山水不度我，琴声不渡江
+  - 啦啦啦啦啦啦~~~

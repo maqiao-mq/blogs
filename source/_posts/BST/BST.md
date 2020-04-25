@@ -1,5 +1,7 @@
 ---
 title: BST
+tags:
+    - 数据结构
 ---
 
 ## BST

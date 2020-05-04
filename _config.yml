@@ -84,8 +84,7 @@ deploy:
 
 ezread:
   description:
+  - hello，world
   - 逝者如斯夫，不舍昼夜
   - 上善若水，水利万物而不争
-  - hello，world
-  - 山水不度我，琴声不渡江
-  - 啦啦啦啦啦啦~~~
+  - 你若盛开，清风自来

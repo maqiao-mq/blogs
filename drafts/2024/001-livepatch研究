@@ -153,8 +153,101 @@ livepatch 和 module 的对应关系？有没有MD5之类的校验
 
 相关的代码位于[github的kpatch项目](https://github.com/dynup/kpatch)中。
 
-简单来说，有这么几件事：
+整个livepatch module的构建过程，项目的 README 已经写的很清楚了。
+```
+- Build the unstripped vmlinux for the kernel
+- Patch the source tree
+- Rebuild vmlinux and monitor which objects are being rebuilt. These are the "changed objects".
+- Recompile each changed object with -ffunction-sections -fdata-sections, resulting in the changed patched objects
+- Unpatch the source tree
+- Recompile each changed object with -ffunction-sections -fdata-sections, resulting in the changed original objects
+- For every changed object, use create-diff-object to do the following:
+  - Analyze each original/patched object pair for patchability
+  - Add .kpatch.funcs and .rela.kpatch.funcs sections to the output object. The kpatch core module uses this to determine the list of functions that need to be redirected using ftrace.
+  - Add .kpatch.dynrelas and .rela.kpatch.dynrelas sections to the output object. This will be used to resolve references to non-included local and non-exported global symbols. These relocations will be resolved by the kpatch core module.
+  - Generate the resulting output object containing the new and modified sections
+- Link all the output objects into a cumulative object
+- Generate the patch module
+```
 
 ## 怎么检查哪些 object 发生了变化
+先构建一遍内核，然后打上 patch 重新构建一遍，这个时候 make 就会根据源码文件的变化，自动将部分 .o 文件进行重编。
+问题的关键是怎么感知到这部分重编的文件，kpatch的解法是搞一个脚本来替换 gcc。
+首先，在 make 的时候指定 kpatch-cc,用它来替代 gcc：
+```shell
+KPATCH_CC_PREFIX="$TOOLSDIR/kpatch-cc "
+declare -a MAKEVARS
+if [[ -n "$CONFIG_CC_IS_CLANG" ]]; then
+# 这里指定 CC 为 kpatch-cc
+	MAKEVARS+=("CC=${KPATCH_CC_PREFIX}${CLANG}")
+	MAKEVARS+=("HOSTCC=clang")
+else
+	MAKEVARS+=("CC=${KPATCH_CC_PREFIX}${GCC}")
+fi
+
+if [[ -n "$CONFIG_LD_IS_LLD" ]]; then
+	MAKEVARS+=("LD=${KPATCH_CC_PREFIX}${LLD}")
+	MAKEVARS+=("HOSTLD=ld.lld")
+else
+	MAKEVARS+=("LD=${KPATCH_CC_PREFIX}${LD}")
+fi
+
+
+# $TARGETS used as list, no quotes.
+# shellcheck disable=SC2086
+make "${MAKEVARS[@]}" "-j$CPUS" $TARGETS 2>&1 | logger || die
+```
+
+然后，在 kpatch-cc 里面，先用 gcc 来编译下 .o 文件，然后开始记录这个 .o 文件被重编了
+
+```shell
+...
+
+TOOLCHAINCMD="$1"
+shift
+# 这里执行 gcc 构建 .o 文件
+if [[ -z "$KPATCH_GCC_TEMPDIR" ]]; then
+	exec "$TOOLCHAINCMD" "$@"
+fi
+
+...
+
+    *.o)
+        mkdir -p "$KPATCH_GCC_TEMPDIR/orig/$(dirname "$relobj")"
+        [[ -e "$obj" ]] && cp -f "$obj" "$KPATCH_GCC_TEMPDIR/orig/$relobj"
+        # 这里记录 .o 文件已经被重编了
+        echo "$relobj" >> "$KPATCH_GCC_TEMPDIR/changed_objs"
+        break
+        ;;
+...
+```
 ## 怎么 diff 出两个 object 的哪些函数发生了变化
+在编译的时候，会使用 `-ffunction-sections -fdata-sections` 这个选项，这个选项会把每个函数、每个变量放到一个独立的 section 中。
+那么，识别函数的变化，就变成了对比 section 是否有差异了，而对比 section 只需要简单的 memcmp 就可以了。
+这块可以在 `create-diff-object.c` 的 `kpatch_compare_correlated_section()` 和 `kpatch_compare_correlated_nonrela_section()` 中可以看到。
+
+```c
+static void kpatch_compare_correlated_nonrela_section(struct section *sec)
+{
+	struct section *sec1 = sec, *sec2 = sec->twin;
+
+	if (sec1->sh.sh_type != SHT_NOBITS &&
+	    memcmp(sec1->data->d_buf, sec2->data->d_buf, sec1->data->d_size))
+		sec->status = CHANGED;
+	else
+		sec->status = SAME;
+}
+```
+
+
 ## 怎么在抽取变化函数的时候，把它涉及的变量等一起抽取出来
+
+TODO
+
+# livepatch 的限制
+从上面的分析中，可以看到，livepatch 只是 hook 到原始函数，然后让代码的分支走到新的函数上，而且老函数并不会被删除，原有的 text 段并不会受到影响。
+因此，常见的一些限制就可以被理解了，比如：
+1. 不能改变量
+2. 不能往结构体里面加变量
+3. 不能 hook .__init 段里面的函数（因为已经被执行过了，而且大概率不会再被执行）
+...

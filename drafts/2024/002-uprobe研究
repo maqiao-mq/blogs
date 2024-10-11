@@ -1,0 +1,114 @@
+---
+title: uprobe研究
+date: 2024-10-11 23:35:00
+tags:
+    - 内核
+---
+
+# 背景
+在处理一些 uprobe 问题时，发现 uprobe 的 tracefs 用起来并不方便，所以记录下相关用法，方便后续查看。
+
+# 用法
+uprobe的文档可以参考[linux官网链接](https://docs.kernel.org/trace/uprobetracer.html)
+
+常规用法如下。
+假设我们需要有一个函数 f， 这个函数做的事情就是把字符串打印出来：
+```c
+#include <stdio.h>
+
+void f(char * str)
+{
+    printf("%s\n", str);
+}
+
+int main()
+{
+    f("hello world");
+    return 0;
+}
+```
+然后我们想用 uprobe 追踪这个 f，把它的参数打印出来，那么需要这么干：
+```shell
+# 编译
+$ gcc -o test test.c
+
+# 获取 f 在 elf binary 的 text 段中的偏移
+$ objdump -t test | grep -w f
+# 一般会获得类似这样的结果
+# 0000000000446420 g    DF .text  0000000000000012  Base        zfree
+# 第一列是函数在整个 elf 虚拟空间的位置，但是 .text 一般的起始位置是 0x400000，所以需要减去这个值。
+# 那么假设这个最终的值是 0x121f
+
+# 接下来配置 uprobe
+
+$ cd /sys/kernel/debug/tracing
+$ echo 'p /path/to/test:0x121f +0(%di):string' > uprobe_events
+$ echo 1 > events/uprobes/enable
+$ echo 1 > tracing_on
+$ cat trace
+```
+整个流程上要注意的点：
+1. 需要手动获取函数在 elf 中的偏移，记得减一下 text 的起始地址
+2. 还得要 enable 一下才行
+
+如果后续想要停掉它，需要做的事情：
+1. 停止对应 uprobe `echo 0 > events/uprobe/<name>/enable`
+2. 从 uprobe_events 里面删掉它： `echo > uprobe_events`
+
+以上是基本操作。
+但是有些坑爹的地方，官网文档写得不清楚，所以这里记录一下：
+1. 参数是字符串
+根据 linux amd64 的传参规则，%rdi 是第一个参数。假设这个参数是个字符串，我们要把它抓出来，这么写是会报错的：
+`p /path/to/test:0x121f %di:string` 
+不要问为什么，猜测是设计上的失误。为了能正确拿到字符串，得这么干：
+'p /path/to/test:0x121f +0(%di):string'
+没错，就是手动加上一个0偏移。
+
+2. 用户态和内核态内存
+在 uprobe 的语境下，你字符串指定是 string 还是 ustring 都无所谓，内核统一视为用户态内存。
+但是，如果是往 kprobe 里面写配置，那 string 就是指 内核态内存， ustring 是指 用户态内存 了，这两个在处理时不太一样。（一个默认 copy 时不会出现 fault，一个会）
+
+3. 读取寄存器信息。
+书接上文，明明我们要读的是 %rdi，但是我们的格式里面写的却是 %di。必须这么写才行。
+猜测是 linux 为了同一套语法同时兼容 x86_32 和 x86_64 才这么干的，目前来说，支持的寄存器是这些：
+```c
+static const struct pt_regs_offset regoffset_table[] = {
+#ifdef CONFIG_X86_64
+	REG_OFFSET_NAME(r15),
+	REG_OFFSET_NAME(r14),
+	REG_OFFSET_NAME(r13),
+	REG_OFFSET_NAME(r12),
+	REG_OFFSET_NAME(r11),
+	REG_OFFSET_NAME(r10),
+	REG_OFFSET_NAME(r9),
+	REG_OFFSET_NAME(r8),
+#endif
+	REG_OFFSET_NAME(bx),
+	REG_OFFSET_NAME(cx),
+	REG_OFFSET_NAME(dx),
+	REG_OFFSET_NAME(si),
+	REG_OFFSET_NAME(di),
+	REG_OFFSET_NAME(bp),
+	REG_OFFSET_NAME(ax),
+#ifdef CONFIG_X86_32
+	REG_OFFSET_NAME(ds),
+	REG_OFFSET_NAME(es),
+	REG_OFFSET_NAME(fs),
+	REG_OFFSET_NAME(gs),
+#endif
+	REG_OFFSET_NAME(orig_ax),
+	REG_OFFSET_NAME(ip),
+	REG_OFFSET_NAME(cs),
+	REG_OFFSET_NAME(flags),
+	REG_OFFSET_NAME(sp),
+	REG_OFFSET_NAME(ss),
+	REG_OFFSET_END,
+};
+```
+
+# 原理
+uprobe 的原理，大致是根据用户态的配置，将用户态进程的对应位置改成 int3 指令，也就是 0xcc。
+这样，当用户态进程运行到这里时，就会触发 debug 中断。然后，内核响应这个中断，在进程返回用户态的时候，开始进行 uprobe 的处理，比如收集相关信息，打印到 ringbuf 之类的。
+
+# 其他问题
+程序的断点是什么时候打上去的？应该是监控了exec的吧？这块的处理机制可以研究下

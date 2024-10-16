@@ -110,5 +110,11 @@ static const struct pt_regs_offset regoffset_table[] = {
 uprobe 的原理，大致是根据用户态的配置，将用户态进程的对应位置改成 int3 指令，也就是 0xcc。
 这样，当用户态进程运行到这里时，就会触发 debug 中断。然后，内核响应这个中断，在进程返回用户态的时候，开始进行 uprobe 的处理，比如收集相关信息，打印到 ringbuf 之类的。
 
-# 其他问题
-程序的断点是什么时候打上去的？应该是监控了exec的吧？这块的处理机制可以研究下
+替换时机：
+1. 首次注册 uprobe 打上断点
+首次注册 uprobe 时，会根据文件的 inode->mapping 反查到所有 vma，然后在符合条件的 vma 上打上断点。
+
+
+2. 后续新进程启动后打断点
+在 uprobe 注册的时候，内核已经记录了对应文件的 inode 号，以及偏移等信息了。当发生 vma fault 的时候，就会看这个 vma 是不是对应文件，文件在不在 uprobe 要替换的列表中，以及对应的偏移对不对得上这个发生 fault 的页。
+可以在 `mm/mmap.c` 和 `mm/vma.c` 中看到 uprobe_mmap() 函数的调用。

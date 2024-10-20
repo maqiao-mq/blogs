@@ -1,9 +1,0 @@
-# kprobe
-
-# uprobe
-
-Q: 一个进程在启动的时候是怎么被打上uprobe的断点的？
-
-# fprobe
-
-# eprobe

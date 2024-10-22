@@ -60,6 +60,7 @@ struct dyn_ftrace {
 
 - bpf trampoline 和 livepatch 有一段时间是不兼容的，为了让二者能同时在一个 record 生效，upstream 又引入了 ftrace_ops->ops_func() 来解决
 - ftrace trampoline 和 bpf trampoline 不是同一个东西，而且 ftrace trampoline 引入的时间很早，但是它只会在 record 只有一个hook 的时候生效，break 这个限制的时候，将会退化成调用 `ftrace_ops_list_func`，它会遍历每个 ftrace_ops，找到匹配当前 ip 的哪些 ops，然后调用一遍回调，比较慢。
+- 为了 `ftrace_ops_list_func`能遍历所有的 ftrace_ops，ftrace 用 `ftrace_ops_list` 这个链表头把所有的 ftrace ops 都串起来了。
 
 ## ftrace_ops
 
@@ -69,12 +70,16 @@ struct dyn_ftrace {
 
 函数 `ftrace_set_filter_ip`就是用来配置 ftrace 在哪些 record 上生效的，而函数 `register_ftrace_function`则是用来将 ftrace_ops 挂载到对应的 record 上，使其正式生效的。
 
+函数 `ftrace_set_notrace`则是配置 ftrace ops 在哪些 record 暂时不生效。
+
+为此，每个 ftrace ops 有2个哈希表：
+
+* filter_hash 用来配置这个 ftrace ops 关联了哪些 record
+* notrace_hash 用来配置这个 ftrace ops 在哪些 record 上生效
 
 # kprobe
 
 # uprobe
-
-Q: 一个进程在启动的时候是怎么被打上uprobe的断点的？
 
 # fprobe
 

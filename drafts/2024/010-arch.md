@@ -103,7 +103,8 @@ void cpu_startup_entry(enum cpuhp_state state)
   - 如果 `cpu_idle_force_poll`的值不为0，或者其他cpu正在准备广播ipi之类的中断过来，则进入idle poll 模式
     - `cpu_idle_force_poll`的值一般会被两个cmdline影响。`nohlt`会把它初始化为1，`idle=poll`会让它自增1。部分firmware或者arm的一些板子的驱动也会让它自增1.
   - 否则，会调用 `cpuidle_idle_call()`进入idle_call模式。
-    - 这里就会governor和driver，来决定并进入哪个idle state来idle一次。
+    - 如果判定要进入s2idle，那么就会找最深的idle state进去。s2idle的意思是suspend to idle，这个表示把所有的用户态进程都freeze，并且所有的I/O设备也被挂起了，甚至时钟中断都会被完全停掉，最多只等一个中断过来，这种休眠状态进入最深的idle state很正常。
+    - 如果不进入s2idle，则正常让governor去选择idle state，然后idle一次。
 - 在判定 `need_resched()`之后，从循环退出来。此时调用 `schedule_idle()`将当前idle线程换出去，换其他进程进来运行。记住，idle永远是最低优先级的进程，只有调无可调的时候才会走到这里来。
 
 执行idle动作的线程每个cpu一个，它们的pid都是0，线程名是 `swapper/x`（x是cpu id）。内核没有把它们的信息注册到/proc/下面，ps命令也捞不到他们的信息。如果需要看到他们的话，则需要在机器上运行crash命令，在里面执行ps强行捞出来所有内核的信息才行。
@@ -168,4 +169,29 @@ static void __init intel_idle_cpuidle_driver_init(struct cpuidle_driver *drv)
 ```
 
 
-driver没有优先级的概念，所有他们的生效又要通过另一套逻辑来做。TODO
+driver没有优先级的概念，所有他们的生效又要通过另一套逻辑来做。driver的逻辑是先来的就能把坑位占住，后续的就全部失败。如果占住坑位的driver，还自己有指定倾向的governor（比如haltpoll的driver倾向于用haltpoll governor），内核还会尝试切换到对应的governor。
+
+driver之间的优先级关系是完全没有定义的，全凭各自的君子协定。比如说，在虚拟机环境下，mwait之类的指令可能没做虚拟化，不被支持，那么intel_idle会自觉地不开，然后haltpoll自己检测到这是个虚拟化环境，就主动去注册了。
+
+driver 和 governor 之间也有先后顺序，driver一般是在 module_init（等价于device_initcall） 或者 中注册的，而governor则一般是在postcore_initcall中注册的。从内核对各种call的调用顺序可以看出来，governor的时机早于driver。
+
+```
+#define pure_initcall(fn)		__define_initcall(fn, 0)
+
+#define core_initcall(fn)		__define_initcall(fn, 1)
+#define core_initcall_sync(fn)		__define_initcall(fn, 1s)
+#define postcore_initcall(fn)		__define_initcall(fn, 2)
+#define postcore_initcall_sync(fn)	__define_initcall(fn, 2s)
+#define arch_initcall(fn)		__define_initcall(fn, 3)
+#define arch_initcall_sync(fn)		__define_initcall(fn, 3s)
+#define subsys_initcall(fn)		__define_initcall(fn, 4)
+#define subsys_initcall_sync(fn)	__define_initcall(fn, 4s)
+#define fs_initcall(fn)			__define_initcall(fn, 5)
+#define fs_initcall_sync(fn)		__define_initcall(fn, 5s)
+#define rootfs_initcall(fn)		__define_initcall(fn, rootfs)
+#define device_initcall(fn)		__define_initcall(fn, 6)
+#define device_initcall_sync(fn)	__define_initcall(fn, 6s)
+#define late_initcall(fn)		__define_initcall(fn, 7)
+#define late_initcall_sync(fn)		__define_initcall(fn, 7s)
+
+```

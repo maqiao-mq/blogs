@@ -77,7 +77,69 @@ struct dyn_ftrace {
 * filter_hash 用来配置这个 ftrace ops 关联了哪些 record
 * notrace_hash 用来配置这个 ftrace ops 在哪些 record 上生效
 
+
+## ftrace的生效、修改、执行
+
+这里记录的先不考虑ftrace trampoline的情况（这个情况目前只在x86上有，是一种优化措施)。
+
+这里先说下执行的逻辑：
+
+在x86上，如果没有使用ftrace trampoline的话，那么全局所有的record都只会共享同两个handler。这意味着不管是哪个函数的ftrace，生效后入口都是一样的。这个入口是汇编写的，在 `arch/x86/kernel/ftrace_64.S`里面。如果ftrace在处理的时候需要原函数的regs，则handler是 `ftrace_regs_caller `，否则函数是 `ftrace_caller`。
+
+这两个handler都会做一些准备工作，然后调用到真正的handler里面去。这个真正的handler也会根据ftrace的情况发生变化：
+
+- 一般都是 `ftrace_ops_list_func`，这个函数会遍历当前生效的所有ftrace_ops，判断当前ftrace的入口ip是否在ftrace_ops的filter_hash表中，如果是的话就调用这个ftrace_ops的回调。
+- 有些优化场景（比如仅一个ftrace生效），这个handler会直接是ftrace_ops的回调
+- 有时会是 `ftrace_ops_assist_func`，具体情况还未分析
+- 在关闭ftrace的时候，这个函数会是ftrace_stub
+
+这个真正的handler，需要替换到 `ftrace_regs_caller `和 `ftrace_caller`函数的中间位置去，所以内核提前把这两个位子给用symbol标记出来了，分别是 `ftrace_call`和 `ftrace_regs_call`。这个替换的过程，`ftrace_update_ftrace_func()`
+
+
+生效是这样的流程：
+
+1. 先调用 `ftrace_set_filter_ip` 来给ftrace_ops配置要在哪个record上生效
+2. 调用 `register_ftrace_function`来让ftrace_ops生效。
+
+`register_ftrace_function`往下会调用到 `ftrace_startup`，这里是真正让 ftrace 生效的代码。这里的代码涉及到的东西很多，这里只记录一个简化版的：
+
+- 调用 `__register_ftrace_function`将这个ftrace挂到 `ftrace_ops_list`这个全局链表上
+- 调用 `ftrace_hash_ipmodify_enable`，遍历所有record，如果record的ip和这个ftrace要生效的ip对上了，而且这个ftrace是要改返回ip的，那么就要标记这个record为 `FTRACE_FL_IPMODIFY`，方便后续做一些特殊处理。同时，还需要调用 `ops->ops_func`来处理下自己的一些代码，避免livepatch和bpf trampoline这种ip modify 和 direct call 不兼容的情况。
+- 调用 `ftrace_hash_rec_enable`，再次遍历所有record，如果record的ip和这个ftrace要生效的ip对上了，则根据这个record上的情况来判断这个record对应的位置，后续是不是要更新，应该怎么更新，置好对应的flags
+- 调用 `ftrace_startup_enable`来正式做更新。这个实际会调用 `arch_ftrace_update_code`，让不同的平台来自己处理。
+  - 这里会先更新 `ftrace_regs_caller `和 `ftrace_caller`函数里面的 `ftrace_call`和 `ftrace_regs_call`，见上文
+  - 然后，会调用 `ftrace_replace_code()`来真正更新。这里的逻辑是：
+    - 先过一遍所有的record，看下这个即将要更新的动作有没有bug
+    - 再过一遍所有的record，把所有要更新的地址，要更新的指令记录到text_poke的缓冲区中
+    - 调用 `text_poke_finish`一次性将所有的指令都刷上去。
+
+
+这里再记录下 `text_poke_finish`的过程。这里并没有做stop_machine的动作，而是用int3指令巧妙地绕开了。
+
+具体来说，是这样的：
+
+- 先把所有要更新的地址，都替换成int3，因为int3只有一个字节，所以更新是原子的，安全的
+- 把int3后面的几个字节的部分替换成新的指令
+- 最后一把把所有的int3再换成新的指令，这样新的指令就被完全被更新上去了
+
+期间，如果踩到了更新到一半的指令，也最多是触发int3，然后只需要在int3里面处理下就行了。
+
+
+注意，ftrace的生效其实会换两个地方的指令：
+
+- 第一个地方是 `ftrace_regs_caller `和 `ftrace_caller`函数里面的 `ftrace_call`和 `ftrace_regs_call`，这个地方的原理和上文中的也类似，只不过是单条指令的更新，而不是批量的更新
+- 第二个地方是上文说到的所有record的地址的更新，这里是批量的
+
 # kprobe
+
+kprobe 根据实际情况分为几种：
+
+1. 如果probe的ip是ftrace的那几个nop，则直接调用ftrace的更新机制
+2. 否则，要单独处理。
+
+kprobe提供了两个handler，pre_handler和post_handler，含义是在probe的那条指令执行前和执行后分别执行。
+
+//TODO
 
 # uprobe
 

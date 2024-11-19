@@ -139,7 +139,82 @@ kprobe 根据实际情况分为几种：
 
 kprobe提供了两个handler，pre_handler和post_handler，含义是在probe的那条指令执行前和执行后分别执行。
 
-//TODO
+如果两个handler都要生效，那么流程是这样的：
+
+1. 原地址的字节码被改为了int3，执行流程踩到了这个地方，触发debug中断，执行 `kprobe_int3_handler`
+2. 在 `kprobe_int3_handler`中：执行pre_handler，设置TF标志位（表示后续执行一条流程后就会继续触发int3中断），并修改返回地址为一个临时的代码片段
+3. 这个片段有一个原始的，被改过的指令，以及一条跳转到原指令的下一条的指令（jmp指令）。这会儿，先执行原指令，然后因为TF标志位的原因，会再次触发中断，这次进入到 `kprobe_debug_handler`
+4. 在 `kprobe_debug_handler`中，执行post_handler，清除TF标志位，然后跳转回代码片段的jmp指令
+5. jmp指令执行，回到原地址的下一条指令继续往下执行
+
+可以看到，这里是有2次中断的。
+
+如果只需要pre_handler，那么就可以优化，避免这些中断，流程是这样的：
+
+1. 原地址的字节码被改成了jmp指令，用于跳转到一个临时的代码片段中。执行流程走到这里，就会直接jmp过去。
+2. 代码片段的行为分别是：
+
+- 保存栈帧
+- 保存寄存器
+- 调用pre_handler
+- 恢复寄存器和栈帧
+- 执行原来被改成jmp的那些指令（都被copy到这个代码片段上了）
+- 跳转会原地址的后续第一条完整指令上，继续运行
+
+在x86上，因为指令是变长的，而一条jmp指令是5个字节，所以其实很难说的清楚到底原地址有几条指令被改坏了。因此，这需要内核自带一个解析字节码的解释器，以此界定正常指令和被改坏的指令的分界点，从而决定哪些指令要被copy到代码片段上，以及jmp回去应该从哪条指令开始。
+
+# text poke
+
+在x86上，kprobe 修改原地址的指令，是通过 text poke 来完成的。这个text poke有两种改法：
+
+1. `text_poke`，适用于用于替代的指令能在一次原子性操作内完成。比如x86，能在
+2. `text_poke_bp`，适用于非原子性的修改
+
+先说 `text_poke`，它的修改原理是这样的：
+
+1. 在内核初始化的时候，准备一个临时的mm_struct，称为poking_mm，以及一个临时的可以被用来映射的地址poking_addr，这个地址需要不会被内核其他功能用到，所以是基于TASK_UNMAPPED_BASE再随机偏移一点。
+2. 在修改的时候，使用这个mm_struct，把需要修改指令的地址所在的那个page，映射到poking_addr位置上
+3. 一次性原子性地改掉这个原指令
+4. 恢复原来的mm_struct
+5. 调用 `flush_tlb_mm_range`来刷每个cpu的tlb，确保每个cpu下次运行时，能够直接运行到新的指令上去
+
+
+再说 `text_poke_bp`，它既可以改一个比较长的指令（比如jmp），也可以批量改一堆指令。它的原理在内核代码的注释里面已经写得很清楚了。主要是这样的：
+
+1. 把每个需要修改的地址的开头改成int3
+2. sync cores
+3. 把除了int3以外的部分，都改成新的指令
+4. sync cores
+5. 把int3的位置也改成新的指令
+6. sync cores
+
+这个方法，相当于用 int3 对这些要修改的地址都做了一层屏障。保证了替换到一半的过程中，其他执行流不会错误地踩到一般的指令上去。
+
+这种方法的好处是，不会有任何stop_machine的过程，不会影响性能。
+
+```
+/**
+ * text_poke_bp_batch() -- update instructions on live kernel on SMP
+ * @tp:			vector of instructions to patch
+ * @nr_entries:		number of entries in the vector
+ *
+ * Modify multi-byte instruction by using int3 breakpoint on SMP.
+ * We completely avoid stop_machine() here, and achieve the
+ * synchronization using int3 breakpoint.
+ *
+ * The way it is done:
+ *	- For each entry in the vector:
+ *		- add a int3 trap to the address that will be patched
+ *	- sync cores
+ *	- For each entry in the vector:
+ *		- update all but the first byte of the patched range
+ *	- sync cores
+ *	- For each entry in the vector:
+ *		- replace the first byte (int3) by the first byte of
+ *		  replacing opcode
+ *	- sync cores
+ */
+```
 
 # uprobe
 

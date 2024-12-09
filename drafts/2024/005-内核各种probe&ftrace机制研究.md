@@ -77,7 +77,6 @@ struct dyn_ftrace {
 * filter_hash 用来配置这个 ftrace ops 关联了哪些 record
 * notrace_hash 用来配置这个 ftrace ops 在哪些 record 上生效
 
-
 ## ftrace的生效、修改、执行
 
 这里记录的先不考虑ftrace trampoline的情况（这个情况目前只在x86上有，是一种优化措施)。
@@ -94,7 +93,6 @@ struct dyn_ftrace {
 - 在关闭ftrace的时候，这个函数会是ftrace_stub
 
 这个真正的handler，需要替换到 `ftrace_regs_caller `和 `ftrace_caller`函数的中间位置去，所以内核提前把这两个位子给用symbol标记出来了，分别是 `ftrace_call`和 `ftrace_regs_call`。这个替换的过程，`ftrace_update_ftrace_func()`
-
 
 生效是这样的流程：
 
@@ -113,7 +111,6 @@ struct dyn_ftrace {
     - 再过一遍所有的record，把所有要更新的地址，要更新的指令记录到text_poke的缓冲区中
     - 调用 `text_poke_finish`一次性将所有的指令都刷上去。
 
-
 这里再记录下 `text_poke_finish`的过程。这里并没有做stop_machine的动作，而是用int3指令巧妙地绕开了。
 
 具体来说，是这样的：
@@ -123,7 +120,6 @@ struct dyn_ftrace {
 - 最后一把把所有的int3再换成新的指令，这样新的指令就被完全被更新上去了
 
 期间，如果踩到了更新到一半的指令，也最多是触发int3，然后只需要在int3里面处理下就行了。
-
 
 注意，ftrace的生效其实会换两个地方的指令：
 
@@ -178,7 +174,6 @@ kprobe提供了两个handler，pre_handler和post_handler，含义是在probe的
 4. 恢复原来的mm_struct
 5. 调用 `flush_tlb_mm_range`来刷每个cpu的tlb，确保每个cpu下次运行时，能够直接运行到新的指令上去
 
-
 再说 `text_poke_bp`，它既可以改一个比较长的指令（比如jmp），也可以批量改一堆指令。它的原理在内核代码的注释里面已经写得很清楚了。主要是这样的：
 
 1. 把每个需要修改的地址的开头改成int3
@@ -221,3 +216,62 @@ kprobe提供了两个handler，pre_handler和post_handler，含义是在probe的
 # fprobe
 
 # eprobe
+
+
+# CallTrace的打印数据说明
+
+随便找了git log里面一个有代表性的CallTrace来说一下：
+
+```
+    [  T292] Call Trace:
+    [  T292]  <TASK>
+    [  T292]  ? die+0x33/0x90
+    [  T292]  ? do_trap+0xdc/0x110
+    [  T292]  ? napi_enable+0x37/0x40
+    [  T292]  ? do_error_trap+0x70/0xb0
+    [  T292]  ? napi_enable+0x37/0x40
+    [  T292]  ? napi_enable+0x37/0x40
+    [  T292]  ? exc_invalid_op+0x4e/0x70
+    [  T292]  ? napi_enable+0x37/0x40
+    [  T292]  ? asm_exc_invalid_op+0x16/0x20
+    [  T292]  ? napi_enable+0x37/0x40
+    [  T292]  igb_up+0x41/0x150
+    [  T292]  igb_io_resume+0x25/0x70
+    [  T292]  report_resume+0x54/0x70
+    [  T292]  ? report_frozen_detected+0x20/0x20
+    [  T292]  pci_walk_bus+0x6c/0x90
+    [  T292]  ? aer_print_port_info+0xa0/0xa0
+    [  T292]  pcie_do_recovery+0x22f/0x380
+    [  T292]  aer_process_err_devices+0x110/0x160
+    [  T292]  aer_isr+0x1c1/0x1e0
+    [  T292]  ? disable_irq_nosync+0x10/0x10
+    [  T292]  irq_thread_fn+0x1a/0x60
+    [  T292]  irq_thread+0xe3/0x1a0
+    [  T292]  ? irq_set_affinity_notifier+0x120/0x120
+    [  T292]  ? irq_affinity_notify+0x100/0x100
+    [  T292]  kthread+0xe2/0x110
+    [  T292]  ? kthread_complete_and_exit+0x20/0x20
+    [  T292]  ret_from_fork+0x2d/0x50
+    [  T292]  ? kthread_complete_and_exit+0x20/0x20
+    [  T292]  ret_from_fork_asm+0x11/0x20
+    [  T292]  </TASK>
+```
+
+- `<TASK>`表示正在打印的是内核的task栈。x86上有4个栈：
+  - task stack，一般内核态的代码都在这里面执行
+  - exception stack，处理exception的时候使用的
+  - irq stack，中断栈
+  - entry stack，cpu在初始化，执行early entry/exit的时候使用
+- 以 `?`开头的函数，表示内核不确定是不是真的调用了这个函数。这里的本质是，内核在dump stack的时候，是先遍历自己的几个栈，然后再在栈里遍历自己的栈帧frame，然后每个栈帧里面每8个字节地遍历，如果发现这8个字节的数据像是内核函数，就把它打印出来，这种函数当然是不确定的。当然，栈帧对应的函数，就是能百分百确定在调用的函数。
+- 函数后面会加上两个十六进制，比如 `pci_walk_bus+0x6c/0x90`，第一个数是ip在函数中的偏移，第二个是这个函数的长度。
+- `</TASK>`表示这个stack打印结束了
+
+
+
+内核对栈的展开有几种方式：
+
+* orc。内核根据dwarf格式转成orc。orc会记录每个ip对应framepointer应该在哪个寄存器中，以什么方式取出来。比如rsp、rbp、r10、r13等等。
+* frame。这个会假定rbp里面存的就是栈帧指针（具体实现肯定是通过config保证一定会存在rbp上），只需要读取rbp，以及根据栈帧上存的return地址反向往上逐级解析，即可找到每一级的栈帧。
+* guess。这个是猜栈帧，具体实现没看过。
+
+目前x86默认的，最推荐的方式是orc。

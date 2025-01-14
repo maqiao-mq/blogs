@@ -112,7 +112,6 @@ full avg10=xx avg60=xx avg300=xx total=xxx
 - avg10、avg60、avg300，表示最近10秒、60秒、300秒时间内的负载情况。total则是这些时间加和的绝对值。
 - some和full在上文中已经有解释。
 
-
 有一个用法是用epoll来监听系统负载有没有超过某个值，超过了以后就会触发事件。
 
 方法是先打开这几个文件之一，往里面写入检测的阈值：
@@ -122,3 +121,106 @@ full avg10=xx avg60=xx avg300=xx total=xxx
 ```
 
 然后用epoll监听fd，等待事件返回。
+
+
+# signal
+
+## sigframe
+
+我们在使用signal的时候，看似只用了这么一个syscall，但实际上glibc用了两个syscall。
+
+- signal函数是调用rt_sigaction这个syscall来传入参数的。
+- 在信号处理函数执行完毕后，用rt_sigreturn来返回
+
+```
+SYSCALL_DEFINE4(rt_sigaction, int, sig,
+		const struct sigaction __user *, act,
+		struct sigaction __user *, oact,
+		size_t, sigsetsize)
+```
+
+- sig指信号的编号
+- act是新传入的用于处理信号的结构体，oact是用来接上一个
+- sigsetsize用来看传入的sigset_t是否和内核的对得上
+
+x86上sigaction定义如下：
+
+```
+struct sigaction {
+	__sighandler_t sa_handler;
+	unsigned long sa_flags;
+	__sigrestore_t sa_restorer;
+	sigset_t sa_mask;		/* mask last for extensibility */
+};
+```
+
+这里面有两个回调：
+
+- sa_handler，用来处理信号的函数，这个就是调用signal()时传入的handler
+- sa_restorer，用来在处理信号后返回的函数，一般就是直接调rt_sigaction
+
+
+
+单纯来看，还是很难理解为什么会有rt_sigaction。所以需要深入细节。
+
+- 首先，rt_sigaction实际上只是在内核里面填下表，记录信号发生的时候应该用什么handler来处理，其他事情一概不做
+- 接下来，由其他进程或者内核向这个进程发送信号，一般是调kill syscall
+- 现在，进程响应信号。这里面也很复杂了，如果进程在运行，那就要把它打出来；如果在睡觉，那就要把它拉到rq里面，一堆需要处理的事情。总之，最终进程会拿到cpu，然后对信号进行处理
+- 信号一定是在用户态处理的。所以，当进程一路从内核返回到用户态的时候，最后会检查是不是有信号pending，有的话就要准备处理了。这个在 `exit_to_user_mode_loop()`中。
+
+对于x86来说，它要做的事情，是准备sigframe，好让进程回到用户态的时候直接执行signal handler，而不是沿着原来的路径继续运行。这个在 `setup_rt_frame()`中。
+
+它的frame大概长这样：
+
+```
+ * -------------------------
+ * | alignment padding     |
+ * -------------------------
+ * | (f)xsave frame        |
+ * -------------------------
+ * | fsave header          |
+ * -------------------------
+ * | alignment padding     |
+ * -------------------------
+ * | siginfo + ucontext    |
+ * -------------------------
+```
+
+其中xsave和fsave是用来存x86的特殊寄存器的。siginfo和ucontext的信息见下面的结构体定义：
+
+```
+struct rt_sigframe {
+	char __user *pretcode;
+	struct ucontext uc;
+	struct siginfo info;
+	/* fp state follows here */
+};
+
+struct ucontext {
+	unsigned long	  uc_flags;
+	struct ucontext  *uc_link;
+	stack_t		  uc_stack;
+	struct sigcontext uc_mcontext;
+	sigset_t	  uc_sigmask;	/* mask last for extensibility */
+};
+
+typedef struct siginfo {
+	union {
+		__SIGINFO;
+		int _si_pad[SI_MAX_SIZE/sizeof(int)];
+	};
+} __ARCH_SI_ATTRIBUTES siginfo_t;
+```
+
+这里面，ucontext和siginfo都不重要，重要的是有个额外的字段——pretcode，这个字段是一个指针，放的是rt_sigaction传进来的restorer的值。
+
+在sigframe做好以后，内核的下一步动作，是调整用户态的sp和ip寄存器，分别执行sigframe和handler。那么，这样返回的时候就会直接到handler上运行了。
+
+回忆一下，x86上栈是从高地址到低地址的，而pretcode是在rt_sigframe的最低位置，所以它实际上是在最低的位置上。再仔细往下想，handler执行完毕后，调用ret指令，会从栈顶弹一个地址作为返回地址，恰好这个地址就是pretcode的值。而pretcode存放的是restorer的地址，在glibc上就是rt_sigreturn。
+
+所以，整体的流程是：
+
+1. 在进程退出到用户态的时候，构建sigframe
+2. 调整ip为handler
+3. handler执行完毕后，ret指令走到rt_sigreturn
+4. rt_sigreturn清理掉原来的sigframe，复原之前的寄存器，程序继续正常往下执行
